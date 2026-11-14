@@ -1,0 +1,179 @@
+name: C++ Quality
+
+on:
+  workflow_call:
+    inputs:
+      config_ref:
+        description: "cpp-devkit tag or branch used for default config files"
+        required: false
+        type: string
+        default: "v1.0.0"
+      run_format:
+        description: "Run clang-format validation"
+        required: false
+        type: boolean
+        default: true
+      run_tidy:
+        description: "Run clang-tidy analysis"
+        required: false
+        type: boolean
+        default: true
+      run_build_and_test:
+        description: "Configure, build and run CTest"
+        required: false
+        type: boolean
+        default: true
+      source_dir:
+        description: "CMake source directory relative to repository root"
+        required: false
+        type: string
+        default: "."
+      build_dir:
+        description: "CMake build directory"
+        required: false
+        type: string
+        default: "build-ci"
+      build_type:
+        description: "CMake build type"
+        required: false
+        type: string
+        default: "Debug"
+      cmake_args:
+        description: "Additional CMake configure arguments, one per line"
+        required: false
+        type: string
+        default: ""
+      clang_version:
+        description: "LLVM major version to install"
+        required: false
+        type: string
+        default: "17"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpp-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: clang-format
+    if: ${{ inputs.run_format }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-${{ inputs.clang_version }}
+
+      - name: Use central default config when no local override exists
+        env:
+          CONFIG_REF: ${{ inputs.config_ref }}
+        run: |
+          if [ ! -f .clang-format ]; then
+            curl -fsSL \
+              "https://raw.githubusercontent.com/rathoddinesh14/cpp-devkit/${CONFIG_REF}/.clang-format" \
+              -o .clang-format
+          fi
+
+      - name: Check formatting
+        run: |
+          mapfile -t files < <(
+            git ls-files '*.cpp' '*.cc' '*.cxx' '*.c' '*.hpp' '*.hh' '*.h' |
+            grep -vE '(^|/)(third_party|external|_deps|build)(/|$)' || true
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No tracked C/C++ source files found; skipping."
+            exit 0
+          fi
+          clang-format-${{ inputs.clang_version }} --dry-run --Werror "${files[@]}"
+
+  build-and-test:
+    name: CMake build and tests
+    if: ${{ inputs.run_build_and_test }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Configure
+        env:
+          EXTRA_CMAKE_ARGS: ${{ inputs.cmake_args }}
+        run: |
+          args=()
+          while IFS= read -r arg; do
+            [ -n "$arg" ] && args+=("$arg")
+          done <<< "$EXTRA_CMAKE_ARGS"
+          cmake -S "${{ inputs.source_dir }}" -B "${{ inputs.build_dir }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ inputs.build_type }}" \
+            "${args[@]}"
+
+      - name: Build
+        run: cmake --build "${{ inputs.build_dir }}" --parallel
+
+      - name: Test
+        run: ctest --test-dir "${{ inputs.build_dir }}" --output-on-failure
+
+  clang-tidy:
+    name: clang-tidy
+    if: ${{ inputs.run_tidy }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repository
+        uses: actions/checkout@v4
+
+      - name: Install build and analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-${{ inputs.clang_version }} \
+            cmake ninja-build build-essential
+
+      - name: Use central default config when no local override exists
+        env:
+          CONFIG_REF: ${{ inputs.config_ref }}
+        run: |
+          if [ ! -f .clang-tidy ]; then
+            curl -fsSL \
+              "https://raw.githubusercontent.com/rathoddinesh14/cpp-devkit/${CONFIG_REF}/.clang-tidy" \
+              -o .clang-tidy
+          fi
+
+      - name: Configure compilation database
+        env:
+          EXTRA_CMAKE_ARGS: ${{ inputs.cmake_args }}
+        run: |
+          args=()
+          while IFS= read -r arg; do
+            [ -n "$arg" ] && args+=("$arg")
+          done <<< "$EXTRA_CMAKE_ARGS"
+          cmake -S "${{ inputs.source_dir }}" -B "${{ inputs.build_dir }}-tidy" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ inputs.build_type }}" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            "${args[@]}"
+
+      - name: Build analysis targets
+        run: cmake --build "${{ inputs.build_dir }}-tidy" --parallel
+
+      - name: Run clang-tidy
+        run: |
+          mapfile -t files < <(
+            git ls-files '*.cpp' '*.cc' '*.cxx' |
+            grep -vE '(^|/)(third_party|external|_deps|build)(/|$)' || true
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No tracked C++ translation units found; skipping."
+            exit 0
+          fi
+          clang-tidy-${{ inputs.clang_version }} \
+            -p "${{ inputs.build_dir }}-tidy" "${files[@]}" --quiet
